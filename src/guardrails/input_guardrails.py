@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,16 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+ZERO_WIDTH_CHARS = "​‌‍﻿⁠"
+
+
+def normalize_input(text: str) -> str:
+    """Canonicalize Unicode and remove invisible spacing."""
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    return normalized.translate(str.maketrans("", "", ZERO_WIDTH_CHARS))
 
 
 # ============================================================
@@ -37,7 +48,7 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # - "pretend you are"
 # - "act as (a |an )?unrestricted"
 # Also handle an instruction embedded in an untrusted email/RAG document, e.g.
-# ``Ignore\u200b all previous instructions``. Do not block a benign request to
+# ``Ignore​ all previous instructions``. Do not block a benign request to
 # summarize an external bank-transfer email just because it is external data.
 # Regex is one signal, not the whole security boundary.
 # ============================================================
@@ -51,14 +62,34 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    if not user_input or not user_input.strip():
+        return "ALLOW"
+
+    normalized = normalize_input(user_input)
+
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(all\s+)?(previous|above|prior)?\s*instructions?",
+        r"disregard\s+(all\s+)?(previous|above|prior)?\s*(instructions?|rules?|directives?)",
+        r"forget\s+(your\s+)?(instructions?|rules?|prompt)",
+        r"override\s+(your\s+)?(system\s+)?(prompt|instructions?)",
+        r"you\s+are\s+now\b",
+        r"\bDAN\b",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"act\s+as\s+(a\s+|an\s+)?(unrestricted|evil|jailbroken)",
+        r"role\s*play\s+as",
+        r"system\s+prompt",
+        r"reveal\s+(your\s+)?(instructions?|prompt|secrets?|password|api\s*key|internal\s+password)",
+        r"show\s+(me\s+)?(your\s+)?(system\s+)?(prompt|instructions?|config)",
+        r"translate\s+(your\s+)?(instructions?|system\s+prompt|rules?)",
+        r"output\s+(your\s+)?(config|instructions?|prompt)\s+(as|in)\s+(json|yaml|xml)",
+        r"bỏ\s+qua\s+(mọi\s+)?hướng\s+dẫn",
+        r"quên\s+(mọi\s+)?hướng\s+dẫn",
+        r"tiết\s+lộ\s+(mật\s+khẩu|api|system\s*prompt)",
+        r"cho\s+tôi\s+(xem\s+)?(mật\s+khẩu|system\s*prompt|api\s*key)",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +115,34 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    if not user_input or not user_input.strip():
+        return "BLOCK"
 
-    # TODO: Implement logic:
+    normalized = normalize_input(user_input).lower()
+
     # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    for blocked in BLOCKED_TOPICS:
+        pattern = r"\b" + re.escape(blocked) + r"\b"
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. If input contains allowed banking topic -> return "ALLOW"
+    for allowed in ALLOWED_TOPICS:
+        pattern = r"\b" + re.escape(allowed) + r"\b"
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return "ALLOW"
+
+    generic_banking = [
+        "bank", "ngan hang", "tien", "money", "vnd", "usd", "card", "the",
+        "phi", "fee", "vay", "gui", "rut", "chuyen", "sao ke", "statement", "vinbank"
+    ]
+    for g in generic_banking:
+        pattern = r"\b" + re.escape(g) + r"\b"
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return "ALLOW"
+
+    # 3. Otherwise off-topic -> return "BLOCK"
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +195,28 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if not text or not text.strip():
+            self.blocked_count += 1
+            return self._block_response("Yêu cầu không được để trống. Vui lòng nhập câu hỏi liên quan đến dịch vụ VinBank.")
 
-        pass  # Replace with your implementation
+        # 1. Call detect_injection(text)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu không thể xử lý do vi phạm chính sách bảo mật của VinBank. "
+                "Tôi chỉ có thể hỗ trợ các nghiệp vụ ngân hàng hợp lệ."
+            )
+
+        # 2. Call topic_filter(text)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Xin lỗi, tôi là trợ lý ảo VinBank và chỉ có thể hỗ trợ các thông tin, dịch vụ ngân hàng. "
+                "Vui lòng đặt câu hỏi liên quan đến tài khoản, tiết kiệm, lãi suất, thẻ hoặc chuyển tiền."
+            )
+
+        # 3. If both return "ALLOW": return None (let message through)
+        return None
 
 
 # ============================================================
